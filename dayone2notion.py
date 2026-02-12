@@ -2,6 +2,8 @@ import json
 import glob
 import os
 import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 def process_dayone_json(json_dir, output_csv):
     """
@@ -28,7 +30,20 @@ def process_dayone_json(json_dir, output_csv):
                     continue
 
                 for entry in data['entries']:
-                    creation_date = entry.get('creationDate', '')
+                    creation_date_str = entry.get('creationDate', '')
+                    formatted_date = ''
+                    if creation_date_str:
+                        try:
+                            # Parse UTC date
+                            dt_utc = datetime.fromisoformat(creation_date_str.replace('Z', '+00:00'))
+                            # Convert to JST
+                            dt_jst = dt_utc.astimezone(ZoneInfo("Asia/Tokyo"))
+                            # Format to YYYY-MM-DD
+                            formatted_date = dt_jst.strftime('%Y-%m-%d')
+                        except ValueError:
+                            print(f"Error parsing date: {creation_date_str}")
+                            formatted_date = creation_date_str # Fallback to original
+
                     text = entry.get('text', '')
 
                     # Process photos
@@ -44,8 +59,8 @@ def process_dayone_json(json_dir, output_csv):
                     photos_str = ", ".join(photos)
 
                     all_entries.append({
-                        'Title': creation_date,
-                        'Date': creation_date,
+                        'Title': formatted_date,
+                        'Date': formatted_date,
                         'Text': text,
                         'Photos': photos_str
                     })
