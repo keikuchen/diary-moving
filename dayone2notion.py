@@ -44,6 +44,7 @@ def process_dayone_json(json_dir, output_csv):
                     photos_str = ", ".join(photos)
 
                     all_entries.append({
+                        'Title': creation_date,
                         'Date': creation_date,
                         'Text': text,
                         'Photos': photos_str
