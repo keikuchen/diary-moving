@@ -2,4 +2,5 @@
 dayone/
 dayone_export.csv
 keep_entries_folder/
+secrets.json
 toBeImported.json
