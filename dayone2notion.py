@@ -1,86 +1,247 @@
 import json
 import glob
 import os
-import pandas as pd
+import time
+import mimetypes
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from notion_client import Client
+import httpx
 
-def process_dayone_json(json_dir, output_csv):
+# Configuration
+SECRETS_FILE = "secrets.json"
+DAYONE_DIR = "dayone"
+PHOTOS_DIR = os.path.join(DAYONE_DIR, "photos")
+
+def load_secrets():
+    """Loads Notion credentials from secrets.json."""
+    try:
+        with open(SECRETS_FILE, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Error: {SECRETS_FILE} not found. Please create it with NOTION_TOKEN and NOTION_DATABASE_ID.")
+        return None
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON in {SECRETS_FILE}.")
+        return None
+
+def upload_file_to_notion(file_path, notion_token):
     """
-    Reads all JSON files in the specified directory and converts DayOne entries to a CSV file.
-
-    Args:
-        json_dir (str): Directory containing DayOne JSON files.
-        output_csv (str): Path to the output CSV file.
+    Uploads a file to Notion using the 3-step flow:
+    1. Create a File Upload object
+    2. Send the file
+    3. Return the file upload ID to be attached
     """
-    all_entries = []
+    if not os.path.exists(file_path):
+        return None
 
-    # Find all JSON files in the directory
-    json_files = glob.glob(os.path.join(json_dir, "*.json"))
+    filename = os.path.basename(file_path)
+    content_type, _ = mimetypes.guess_type(file_path)
+    if not content_type:
+        content_type = "application/octet-stream"
 
-    print(f"Found {len(json_files)} JSON files in {json_dir}")
+    headers = {
+        "Authorization": f"Bearer {notion_token}",
+        "Notion-Version": "2022-06-28" # Using a recent version, verify if specific version needed
+    }
 
+    # Custom client for these specific endpoints if SDK doesn't support them well yet
+    base_url = "https://api.notion.com/v1"
+
+    try:
+        # Step 1: Create File Upload object
+        # POST /v1/file_uploads
+        resp1 = httpx.post(
+            f"{base_url}/file_uploads",
+            headers=headers,
+            json={
+                "filename": filename,
+                "content_type": content_type
+            }
+        )
+        resp1.raise_for_status()
+        upload_data = resp1.json()
+        file_upload_id = upload_data.get("id")
+        signed_upload_url = upload_data.get("signed_upload_url") # Hypothetical, need to check response structure
+        # The user guide says: "Send the file — POST /v1/file_uploads/{id}/send"
+        # So maybe we don't get a signed url, but use the ID in the URL.
+
+        # Step 2: Send the file
+        # POST /v1/file_uploads/{id}/send
+        # Using multipart/form-data with 'file' key
+        with open(file_path, "rb") as f:
+            files = {"file": (filename, f, content_type)}
+            resp2 = httpx.post(
+                f"{base_url}/file_uploads/{file_upload_id}/send",
+                headers=headers,
+                files=files,
+                timeout=60.0 # Uploads might take time
+            )
+            resp2.raise_for_status()
+
+        return file_upload_id
+
+    except Exception as e:
+        print(f"Error uploading {filename}: {e}")
+        # Print response text for debugging if available
+        if 'resp1' in locals() and hasattr(resp1, 'text'):
+             print(f"Step 1 Resp: {resp1.text}")
+        if 'resp2' in locals() and hasattr(resp2, 'text'):
+             print(f"Step 2 Resp: {resp2.text}")
+        return None
+
+def process_dayone_json_to_notion():
+    secrets = load_secrets()
+    if not secrets:
+        return
+
+    notion_token = secrets["NOTION_TOKEN"]
+    database_id = secrets["NOTION_DATABASE_ID"]
+
+    notion = Client(auth=notion_token)
+
+    json_files = glob.glob(os.path.join(DAYONE_DIR, "*.json"))
+    print(f"Found {len(json_files)} JSON files in {DAYONE_DIR}")
+
+    count = 0
     for file_path in json_files:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
                 if 'entries' not in data:
-                    print(f"Skipping {file_path}: No 'entries' key found.")
                     continue
 
                 for entry in data['entries']:
                     creation_date_str = entry.get('creationDate', '')
                     formatted_date = ''
+                    iso_date_jst = '' # We need ISO format for the Date property, but with timezone info?
+                                      # Notion Date property requires ISO 8601.
+                                      # If we want to store just the date YYYY-MM-DD, we can pass that string.
+
                     if creation_date_str:
                         try:
                             # Parse UTC date
                             dt_utc = datetime.fromisoformat(creation_date_str.replace('Z', '+00:00'))
                             # Convert to JST
                             dt_jst = dt_utc.astimezone(ZoneInfo("Asia/Tokyo"))
-                            # Format to YYYY-MM-DD
+
+                            # Format to YYYY-MM-DD for Title
                             formatted_date = dt_jst.strftime('%Y-%m-%d')
+
+                            # For the actual Date property, we can also use YYYY-MM-DD string
+                            iso_date_jst = dt_jst.strftime('%Y-%m-%d')
+
                         except ValueError:
                             print(f"Error parsing date: {creation_date_str}")
-                            formatted_date = creation_date_str # Fallback to original
+                            formatted_date = creation_date_str
 
                     text = entry.get('text', '')
 
                     # Process photos
-                    photos = []
+                    image_blocks = []
                     if 'photos' in entry:
                         for photo in entry['photos']:
                             md5 = photo.get('md5')
                             file_type = photo.get('type')
                             if md5 and file_type:
                                 filename = f"{md5}.{file_type}"
-                                photos.append(filename)
+                                photo_path = os.path.join(PHOTOS_DIR, filename)
 
-                    photos_str = ", ".join(photos)
+                                if os.path.exists(photo_path):
+                                    print(f"Uploading {filename}...")
+                                    upload_id = upload_file_to_notion(photo_path, notion_token)
 
-                    all_entries.append({
-                        'Title': formatted_date,
-                        'Date': formatted_date,
-                        'Text': text,
-                        'Photos': photos_str
-                    })
+                                    if upload_id:
+                                        # "Attach it... Set the type to 'file_upload' with the upload id."
+                                        # Based on typical Notion block structure, it might be an 'image' block with a specialized type,
+                                        # or a dedicated 'file_upload' block.
+                                        # Given "Supported image types: ...", it likely renders as an image.
+                                        # Let's try the structure:
+                                        # { "type": "image", "image": { "type": "file_upload", "file_upload": { "id": "..." } } }
+                                        image_blocks.append({
+                                            "object": "block",
+                                            "type": "image",
+                                            "image": {
+                                                "type": "file_upload",
+                                                "file_upload": {
+                                                    "id": upload_id
+                                                }
+                                            }
+                                        })
+                                    else:
+                                        # Fallback to text if upload failed
+                                        image_blocks.append({
+                                            "object": "block",
+                                            "type": "paragraph",
+                                            "paragraph": {
+                                                "rich_text": [{"type": "text", "text": {"content": f"[Image Upload Failed: {filename}]"}}]
+                                            }
+                                        })
+
+                    # Construct Page Children
+                    children = []
+
+                    # Add Images at the top
+                    children.extend(image_blocks)
+
+                    # Add Text
+                    # Split by newlines
+                    lines = text.split('\n')
+                    for line in lines:
+                        # Truncate if too long (Notion block limit is 2000 chars)
+                        if len(line) > 2000:
+                            line = line[:2000] + "..."
+
+                        # Empty lines in Notion are just empty paragraphs
+                        children.append({
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [
+                                    {
+                                        "type": "text",
+                                        "text": {
+                                            "content": line
+                                        }
+                                    }
+                                ]
+                            }
+                        })
+
+                    # Create Page
+                    try:
+                        notion.pages.create(
+                            parent={"database_id": database_id},
+                            properties={
+                                "Name": {
+                                    "title": [
+                                        {
+                                            "text": {
+                                                "content": formatted_date
+                                            }
+                                        }
+                                    ]
+                                },
+                                "Date": {
+                                    "date": {
+                                        "start": iso_date_jst
+                                    }
+                                }
+                            },
+                            children=children
+                        )
+                        print(f"Created entry: {formatted_date}")
+                        count += 1
+                        time.sleep(1.0) # slightly increased sleep for uploads safety
+
+                    except Exception as e:
+                        print(f"Error creating page for {formatted_date}: {e}")
+
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
 
-    # Create DataFrame and save to CSV
-    if all_entries:
-        df = pd.DataFrame(all_entries)
-        # Notion prefers "Name" or similar for the title prop, but let's stick to the requested columns for now.
-        # Often "Date" is auto-detected.
-
-        df.to_csv(output_csv, index=False, encoding='utf-8')
-        print(f"Successfully converted {len(all_entries)} entries to {output_csv}")
-    else:
-        print("No entries found.")
+    print(f"Finished processing. Created {count} entries.")
 
 if __name__ == "__main__":
-    # Assuming the script is run from the project root
-    DAYONE_DIR = "dayone"
-    OUTPUT_FILE = "dayone_export.csv"
-
-    process_dayone_json(DAYONE_DIR, OUTPUT_FILE)
+    process_dayone_json_to_notion()
