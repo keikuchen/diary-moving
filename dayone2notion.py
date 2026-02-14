@@ -103,145 +103,179 @@ def process_dayone_json_to_notion():
     json_files = glob.glob(os.path.join(DAYONE_DIR, "*.json"))
     print(f"Found {len(json_files)} JSON files in {DAYONE_DIR}")
 
-    count = 0
+    # Collect all entries first
+    all_entries = []
+    print("Reading and parsing all entries...")
+
     for file_path in json_files:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+                if 'entries' in data:
+                    for entry in data['entries']:
+                         # Pre-calculate sort key (date)
+                         creation_date_str = entry.get('creationDate', '')
+                         if creation_date_str:
+                             try:
+                                 dt_utc = datetime.fromisoformat(creation_date_str.replace('Z', '+00:00'))
+                                 all_entries.append({
+                                     'dt': dt_utc,
+                                     'data': entry
+                                 })
+                             except ValueError:
+                                 pass # Skip invalid dates for sorting purposes, or handle later
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
 
-                if 'entries' not in data:
-                    continue
+    # Sort entries by date
+    all_entries.sort(key=lambda x: x['dt'])
+    print(f"Total entries to import: {len(all_entries)}")
 
-                for entry in data['entries']:
-                    creation_date_str = entry.get('creationDate', '')
-                    formatted_date = ''
-                    iso_date_jst = '' # We need ISO format for the Date property, but with timezone info?
-                                      # Notion Date property requires ISO 8601.
-                                      # If we want to store just the date YYYY-MM-DD, we can pass that string.
+    count = 0
+    skipped_count = 0
+    for item in all_entries:
+        entry = item['data']
+        creation_date_str = entry.get('creationDate', '')
+        formatted_date = ''
+        iso_date_jst = ''
 
-                    if creation_date_str:
-                        try:
-                            # Parse UTC date
-                            dt_utc = datetime.fromisoformat(creation_date_str.replace('Z', '+00:00'))
-                            # Convert to JST
-                            dt_jst = dt_utc.astimezone(ZoneInfo("Asia/Tokyo"))
+        if creation_date_str:
+            try:
+                # Parse UTC date (Already done but re-doing for local var consistency or use cached)
+                dt_utc = item['dt']
+                # Convert to JST
+                dt_jst = dt_utc.astimezone(ZoneInfo("Asia/Tokyo"))
 
-                            # Format to YYYY-MM-DD for Title
-                            formatted_date = dt_jst.strftime('%Y-%m-%d')
+                # Format to YYYY-MM-DD for Title
+                formatted_date = dt_jst.strftime('%Y-%m-%d')
+                iso_date_jst = dt_jst.strftime('%Y-%m-%d')
 
-                            # For the actual Date property, we can also use YYYY-MM-DD string
-                            iso_date_jst = dt_jst.strftime('%Y-%m-%d')
+            except ValueError:
+                print(f"Error parsing date: {creation_date_str}")
+                formatted_date = creation_date_str
 
-                        except ValueError:
-                            print(f"Error parsing date: {creation_date_str}")
-                            formatted_date = creation_date_str
+        # We need ISO format for the Date property, but with timezone info?
+        # Notion Date property requires ISO 8601.
+        # If we want to store just the date YYYY-MM-DD, we can pass that string.
 
-                    text = entry.get('text', '')
+        if creation_date_str:
+            try:
+                # Parse UTC date
+                dt_utc = datetime.fromisoformat(creation_date_str.replace('Z', '+00:00'))
+                # Convert to JST
+                dt_jst = dt_utc.astimezone(ZoneInfo("Asia/Tokyo"))
 
-                    # Process photos
-                    image_blocks = []
-                    if 'photos' in entry:
-                        for photo in entry['photos']:
-                            md5 = photo.get('md5')
-                            file_type = photo.get('type')
-                            if md5 and file_type:
-                                filename = f"{md5}.{file_type}"
-                                photo_path = os.path.join(PHOTOS_DIR, filename)
+                # Format to YYYY-MM-DD for Title
+                formatted_date = dt_jst.strftime('%Y-%m-%d')
 
-                                if os.path.exists(photo_path):
-                                    print(f"Uploading {filename}...")
-                                    upload_id = upload_file_to_notion(photo_path, notion_token)
+                # For the actual Date property, we can also use YYYY-MM-DD string
+                iso_date_jst = dt_jst.strftime('%Y-%m-%d')
 
-                                    if upload_id:
-                                        # "Attach it... Set the type to 'file_upload' with the upload id."
-                                        # Based on typical Notion block structure, it might be an 'image' block with a specialized type,
-                                        # or a dedicated 'file_upload' block.
-                                        # Given "Supported image types: ...", it likely renders as an image.
-                                        # Let's try the structure:
-                                        # { "type": "image", "image": { "type": "file_upload", "file_upload": { "id": "..." } } }
-                                        image_blocks.append({
-                                            "object": "block",
-                                            "type": "image",
-                                            "image": {
-                                                "type": "file_upload",
-                                                "file_upload": {
-                                                    "id": upload_id
-                                                }
-                                            }
-                                        })
-                                    else:
-                                        # Fallback to text if upload failed
-                                        image_blocks.append({
-                                            "object": "block",
-                                            "type": "paragraph",
-                                            "paragraph": {
-                                                "rich_text": [{"type": "text", "text": {"content": f"[Image Upload Failed: {filename}]"}}]
-                                            }
-                                        })
+            except ValueError:
+                print(f"Error parsing date: {creation_date_str}")
+                formatted_date = creation_date_str
 
-                    # Construct Page Children
-                    children = []
+        text = entry.get('text', '')
 
-                    # Add Images at the top
-                    children.extend(image_blocks)
+        # Process photos
+        image_blocks = []
+        if 'photos' in entry:
+            for photo in entry['photos']:
+                md5 = photo.get('md5')
+                file_type = photo.get('type')
+                if md5 and file_type:
+                    filename = f"{md5}.{file_type}"
+                    photo_path = os.path.join(PHOTOS_DIR, filename)
 
-                    # Add Text
-                    # Split by newlines
-                    lines = text.split('\n')
-                    for line in lines:
-                        # Truncate if too long (Notion block limit is 2000 chars)
-                        if len(line) > 2000:
-                            line = line[:2000] + "..."
+                    if os.path.exists(photo_path):
+                        print(f"Uploading {filename}...")
+                        upload_id = upload_file_to_notion(photo_path, notion_token)
 
-                        # Empty lines in Notion are just empty paragraphs
-                        children.append({
-                            "object": "block",
-                            "type": "paragraph",
-                            "paragraph": {
-                                "rich_text": [
-                                    {
-                                        "type": "text",
-                                        "text": {
-                                            "content": line
-                                        }
-                                    }
-                                ]
-                            }
-                        })
-
-                    # Create Page
-                    try:
-                        notion.pages.create(
-                            parent={"database_id": database_id},
-                            properties={
-                                "Name": {
-                                    "title": [
-                                        {
-                                            "text": {
-                                                "content": formatted_date
-                                            }
-                                        }
-                                    ]
-                                },
-                                "Date": {
-                                    "date": {
-                                        "start": iso_date_jst
+                        if upload_id:
+                            # "Attach it... Set the type to 'file_upload' with the upload id."
+                            image_blocks.append({
+                                "object": "block",
+                                "type": "image",
+                                "image": {
+                                    "type": "file_upload",
+                                    "file_upload": {
+                                        "id": upload_id
                                     }
                                 }
-                            },
-                            children=children
-                        )
-                        print(f"Created entry: {formatted_date}")
-                        count += 1
-                        time.sleep(1.0) # slightly increased sleep for uploads safety
+                            })
+                        else:
+                            # Fallback to text if upload failed
+                            image_blocks.append({
+                                "object": "block",
+                                "type": "paragraph",
+                                "paragraph": {
+                                    "rich_text": [{"type": "text", "text": {"content": f"[Image Upload Failed: {filename}]"}}]
+                                }
+                            })        # Construct Page Children
+        children = []
 
-                    except Exception as e:
-                        print(f"Error creating page for {formatted_date}: {e}")
+        # Add Images at the top
+        children.extend(image_blocks)
+
+        # Add Text
+        # Split by newlines
+        lines = text.split('\n')
+        for line in lines:
+            # Truncate if too long (Notion block limit is 2000 chars)
+            if len(line) > 2000:
+                line = line[:2000] + "..."
+
+            # Empty lines in Notion are just empty paragraphs
+            children.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": line
+                            }
+                        }
+                    ]
+                }
+            })
+
+        # Create Page
+        try:
+            notion.pages.create(
+                parent={"database_id": database_id},
+                properties={
+                    "Name": {
+                        "title": [
+                            {
+                                "text": {
+                                    "content": formatted_date
+                                }
+                            }
+                        ]
+                    },
+                    "Date": {
+                        "date": {
+                            "start": iso_date_jst
+                        }
+                    }
+                },
+                children=children
+            )
+            print(f"Created entry: {formatted_date}")
+            count += 1
+            time.sleep(1.0) # slightly increased sleep for uploads safety
+
+        except Exception as e:
+            print(f"Error creating page for {formatted_date}: {e}")
 
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
 
     print(f"Finished processing. Created {count} entries.")
+
+
 
 if __name__ == "__main__":
     process_dayone_json_to_notion()
