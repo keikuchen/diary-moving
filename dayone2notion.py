@@ -242,6 +242,10 @@ def process_dayone_json_to_notion():
             })
 
         # Create Page
+        # NOTE: Notion API has a limit of 100 children blocks per request.
+        # If an entry has more than 100 blocks (lines + images), this create call will fail.
+        # For this migration script, such entries are skipped/fail validation.
+        # To fix, one would need to batch children into groups of 100 and use append_children for the rest.
         try:
             notion.pages.create(
                 parent={"database_id": database_id},
